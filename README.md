@@ -22,7 +22,10 @@ The model will be loaded after installing and opening the application for the fi
 
 This repository is largely dependent on MNN framework and YOLO11n. The main coding is inspired by ChatGPT5.2 and Google Gemini 3 pro. 
 
-![E12C434E-5A80-49E6-9B36-2AEA25C64A3C_1_102_o](https://github.com/user-attachments/assets/011f643e-f8f4-4155-8b52-ae0550c7a81d)
+![CE015472-2E8A-4254-AA6A-5E60A9B3D4B3_4_5005_c](https://github.com/user-attachments/assets/34c19885-521d-4e9c-83aa-dea6bced28de)
+![3711E40D-5B8B-4A80-B881-5721AC66CDDD_4_5005_c](https://github.com/user-attachments/assets/4dfd8731-b87a-4702-b41c-87734670fdab)
+![EB2C6F3A-D80B-4F44-A837-80306FB097DD_4_5005_c](https://github.com/user-attachments/assets/c60c23bf-b11f-450f-873d-91b7aea34c53)
+
 
 
 
