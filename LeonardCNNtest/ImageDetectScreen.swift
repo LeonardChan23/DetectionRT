@@ -5,12 +5,12 @@
 //  Created by 陳暄暢 on 25/12/2025.
 //
 
-
 import SwiftUI
 import PhotosUI
 import AVFoundation
+import Combine
 
-// effect_roi 对应 main.cpp 里的 object_rect
+// effect_roi 对应 demo 里的 object_rect：在 dst×dst 坐标系中，真实内容区域（去掉 padding）
 struct EffectROI {
     var x: CGFloat
     var y: CGFloat
@@ -19,27 +19,80 @@ struct EffectROI {
 }
 
 enum ImageUtils {
+    static func uiImageRaw(from pixelBuffer: CVPixelBuffer) -> UIImage? {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
-    static func normalizedUp(_ image: UIImage) -> UIImage {
-        if image.imageOrientation == .up { return image }
-        let renderer = UIGraphicsImageRenderer(size: image.size)
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width  = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bpr    = CVPixelBufferGetBytesPerRow(pixelBuffer)
+
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+        )
+
+        // 这里用 Data 拷贝一份，避免 provider 生命周期问题
+        let data = Data(bytes: base, count: bpr * height)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+
+        guard let cg = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bpr,
+            space: cs,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else { return nil }
+
+        return UIImage(cgImage: cg, scale: 1.0, orientation: .up)
+    }
+
+
+    static func normalizedUp(_ image: UIImage, maxSide: CGFloat = 2048) -> UIImage {
+        // 既修正 orientation，又避免按原图全尺寸重绘导致内存暴涨
+        let srcSize = image.size
+        let longest = max(srcSize.width, srcSize.height)
+        let scaleDown = min(1.0, maxSide / max(longest, 1))
+
+        let outSize = CGSize(width: floor(srcSize.width * scaleDown),
+                             height: floor(srcSize.height * scaleDown))
+
+        if image.imageOrientation == .up, scaleDown == 1.0 {
+            return image
+        }
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        format.opaque = true
+
+        let renderer = UIGraphicsImageRenderer(size: outSize, format: format)
         return renderer.image { _ in
-            image.draw(in: CGRect(origin: .zero, size: image.size))
+            image.draw(in: CGRect(origin: .zero, size: outSize))
         }
     }
 
-    /// 复刻 main.cpp resize_uniform：输出 416x416 + effect_roi（在 416 坐标系里）
-    static func resizeUniform416(_ image: UIImage) -> (ui416: UIImage, roi: EffectROI, srcPixelSize: CGSize)? {
+
+    /// 复刻 resize_uniform：输出 dst×dst + effect_roi（roi 在 dst 坐标系里）
+    /// - 关键：renderer.scale = 1，确保输出确实是 dst 像素，而不是 dst pt @3x
+    static func resizeUniform(_ image: UIImage, dst: Int) -> (ui: UIImage, roi: EffectROI, srcPixelSize: CGSize)? {
         let img = normalizedUp(image)
         guard let cg = img.cgImage else { return nil }
 
         let srcW = CGFloat(cg.width)
         let srcH = CGFloat(cg.height)
-        let dstW: CGFloat = 416
-        let dstH: CGFloat = 416
+
+        let dstW = CGFloat(dst)
+        let dstH = CGFloat(dst)
 
         let ratioSrc = srcW / srcH
-        let ratioDst = dstW / dstH  // =1
+        let ratioDst = dstW / dstH // =1
 
         var tmpW: CGFloat = 0
         var tmpH: CGFloat = 0
@@ -47,11 +100,13 @@ enum ImageUtils {
         var padY: CGFloat = 0
 
         if ratioSrc > ratioDst {
+            // 宽图：撑满宽，黑边上下
             tmpW = dstW
             tmpH = floor((dstW / srcW) * srcH)
             padX = 0
             padY = floor((dstH - tmpH) / 2.0)
         } else if ratioSrc < ratioDst {
+            // 高图：撑满高，黑边左右
             tmpH = dstH
             tmpW = floor((dstH / srcH) * srcW)
             padY = 0
@@ -63,7 +118,11 @@ enum ImageUtils {
             padY = 0
         }
 
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: dstW, height: dstH))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        format.opaque = true
+
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: dstW, height: dstH), format: format)
         let out = renderer.image { ctx in
             UIColor.black.setFill()
             ctx.fill(CGRect(x: 0, y: 0, width: dstW, height: dstH))
@@ -74,23 +133,21 @@ enum ImageUtils {
         return (out, roi, CGSize(width: srcW, height: srcH))
     }
 
-    /// UIImage(416x416) -> CVPixelBuffer(BGRA)
-    static func pixelBufferBGRA(from image: UIImage) -> CVPixelBuffer? {
+    /// UIImage(dst×dst) -> CVPixelBuffer(BGRA dst×dst)
+    static func pixelBufferBGRA(from image: UIImage, dst: Int) -> CVPixelBuffer? {
         let img = normalizedUp(image)
         guard let cg = img.cgImage else { return nil }
 
-        let w = cg.width
-        let h = cg.height
-
+        let w = dst, h = dst
         var pb: CVPixelBuffer?
         let attrs: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
             kCVPixelBufferCGBitmapContextCompatibilityKey: true
         ]
-        let st = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
-                                     kCVPixelFormatType_32BGRA,
-                                     attrs as CFDictionary, &pb)
-        guard st == kCVReturnSuccess, let pixelBuffer = pb else { return nil }
+        guard CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                  kCVPixelFormatType_32BGRA,
+                                  attrs as CFDictionary, &pb) == kCVReturnSuccess,
+              let pixelBuffer = pb else { return nil }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
@@ -99,18 +156,28 @@ enum ImageUtils {
         let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
 
         let cs = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(.init(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue))
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+        )
 
-        guard let ctx = CGContext(data: base, width: w, height: h,
-                                  bitsPerComponent: 8, bytesPerRow: bpr,
-                                  space: cs, bitmapInfo: bitmapInfo.rawValue) else { return nil }
+        guard let ctx = CGContext(data: base,
+                                  width: w, height: h,
+                                  bitsPerComponent: 8,
+                                  bytesPerRow: bpr,
+                                  space: cs,
+                                  bitmapInfo: bitmapInfo.rawValue) else { return nil }
 
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.interpolationQuality = .high
+        ctx.setBlendMode(.copy)
+
+        // ✅ 不做 flipY
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
         return pixelBuffer
     }
 
-    /// 把 416 坐标系里的 box 映射回原图坐标（复刻 main.cpp draw_bboxes 的数学）
-    static func mapBoxFrom416ToSource(box416: CGRect, roi: EffectROI, srcSize: CGSize) -> CGRect {
+    /// 把 dst 坐标系里的 box 映射回原图像素坐标（复刻 demo draw_bboxes 的数学）
+    static func mapBoxFromDstToSource(boxDst: CGRect, roi: EffectROI, srcSize: CGSize) -> CGRect {
         let srcW = max(srcSize.width, 1)
         let srcH = max(srcSize.height, 1)
 
@@ -120,12 +187,11 @@ enum ImageUtils {
         let widthRatio  = srcW / dstW
         let heightRatio = srcH / dstH
 
-        let x1 = (box416.minX - roi.x) * widthRatio
-        let y1 = (box416.minY - roi.y) * heightRatio
-        let x2 = (box416.maxX - roi.x) * widthRatio
-        let y2 = (box416.maxY - roi.y) * heightRatio
+        let x1 = (boxDst.minX - roi.x) * widthRatio
+        let y1 = (boxDst.minY - roi.y) * heightRatio
+        let x2 = (boxDst.maxX - roi.x) * widthRatio
+        let y2 = (boxDst.maxY - roi.y) * heightRatio
 
-        // clamp
         let cx1 = max(0, min(x1, srcW))
         let cy1 = max(0, min(y1, srcH))
         let cx2 = max(0, min(x2, srcW))
@@ -183,6 +249,17 @@ struct ImageOverlayFit: View {
 
 @MainActor
 final class ImageDetectVM: ObservableObject {
+    private enum BoxNormSpace {
+        case dstSquare   // x/y/w/h 是相对 dst×dst（含 padding）
+        case roiContent  // x/y/w/h 是相对 roi 内容区（不含 padding）
+    }
+//    @Published var debugInput: UIImage? = nil
+//    @Published var showDebugInput: Bool = false
+
+
+    // ✅ 默认：中心点 + 相对 dst×dst
+    private let boxSpace: BoxNormSpace = .dstSquare
+    
     @Published var status: String = "请选择一张图片"
     @Published var picked: UIImage? = nil
     @Published var dets: [(rectNorm: CGRect, label: String, score: Float)] = []
@@ -195,27 +272,55 @@ final class ImageDetectVM: ObservableObject {
 
     func setImage(_ img: UIImage) {
         dets = []
-        status = "已选择图片"
-        picked = img
+        let up = ImageUtils.normalizedUp(img)   // ✅ 统一坐标系
+        picked = up
 
-        if let r = ImageUtils.resizeUniform416(img) {
+        let dst = Int(detector.inputSize)
+        if let r = ImageUtils.resizeUniform(up, dst: dst) {
             roi = r.roi
             srcPixelSize = r.srcPixelSize
-            status = "可开始检测（roi: x=\(Int(r.roi.x)) y=\(Int(r.roi.y)) w=\(Int(r.roi.width)) h=\(Int(r.roi.height)))"
+            status = "可开始检测（dst=\(dst) roi: x=\(Int(r.roi.x)) y=\(Int(r.roi.y)) w=\(Int(r.roi.width)) h=\(Int(r.roi.height)))"
         } else {
             roi = nil
             status = "图片处理失败"
         }
     }
 
+
+
     func detectOnce() {
         guard let img = picked else { return }
-        guard let r = ImageUtils.resizeUniform416(img) else {
+
+        let dst = Int(detector.inputSize)   // ✅ 关键：跟随模型输入尺寸
+
+        guard let r = ImageUtils.resizeUniform(img, dst: dst) else {
             status = "resize_uniform 失败"
             return
         }
-        guard let pb = ImageUtils.pixelBufferBGRA(from: r.ui416) else {
+
+        print("[DBG] model dst=\(dst)")
+        print("[DBG] ui.size(points)=\(r.ui.size), scale=\(r.ui.scale)")
+        print("[DBG] ui.cgImage(px)=\(r.ui.cgImage?.width ?? -1)x\(r.ui.cgImage?.height ?? -1)")
+
+        guard let pb = ImageUtils.pixelBufferBGRA(from: r.ui, dst: dst) else {
             status = "PixelBuffer 创建失败"
+            return
+        }
+
+//        self.debugInput = ImageUtils.uiImageRaw(from: pb)
+
+        
+//        if let dbg = ImageUtils.uiImageRaw(from: pb) {
+//            print("[DBG] pb->ui size(px)=\(dbg.cgImage?.width ?? -1)x\(dbg.cgImage?.height ?? -1)")
+//        }
+
+
+        let pw = CVPixelBufferGetWidth(pb)
+        let ph = CVPixelBufferGetHeight(pb)
+        print("[DBG] pb=\(pw)x\(ph)")
+
+        if pw != dst || ph != dst {
+            status = "内部错误：pb=\(pw)x\(ph)，不是 \(dst)x\(dst)"
             return
         }
 
@@ -225,44 +330,82 @@ final class ImageDetectVM: ObservableObject {
         q.async { [weak self] in
             guard let self else { return }
 
+            // ObjC: detectWithPixelBuffer: => Swift: detect(with:)
             let raw = (self.detector.detect(with: pb) as? [[AnyHashable: Any]]) ?? []
 
             var mapped: [(CGRect, String, Float)] = []
             mapped.reserveCapacity(raw.count)
+            
+            print("[DBG] roi=\(r.roi)")
+            print("[DBG] raw.first=\(raw.first ?? [:])")
 
             for d in raw {
                 guard
-                    let x = d["x"] as? NSNumber,
-                    let y = d["y"] as? NSNumber,
-                    let w = d["w"] as? NSNumber,
-                    let h = d["h"] as? NSNumber,
+                    let xN = d["x"] as? NSNumber,
+                    let yN = d["y"] as? NSNumber,
+                    let wN = d["w"] as? NSNumber,
+                    let hN = d["h"] as? NSNumber,
                     let label = d["label"] as? String,
                     let score = d["score"] as? NSNumber
                 else { continue }
 
-                // detector 输出是相对 416 的 0~1
-                let x1 = CGFloat(truncating: x) * 416
-                let y1 = CGFloat(truncating: y) * 416
-                let ww = CGFloat(truncating: w) * 416
-                let hh = CGFloat(truncating: h) * 416
-                let box416 = CGRect(x: x1, y: y1, width: ww, height: hh)
+                var x  = CGFloat(truncating: xN)   // ✅ 左上角
+                var y  = CGFloat(truncating: yN)
+                var ww = CGFloat(truncating: wN)
+                var hh = CGFloat(truncating: hN)
 
-                // 映射回原图像素坐标
-                let boxSrcPx = ImageUtils.mapBoxFrom416ToSource(box416: box416, roi: r.roi, srcSize: r.srcPixelSize)
 
-                // 转回 0~1（相对原图），用于 overlay
+                // clamp 0~1
+                x  = max(0, min(x, 1))
+                y  = max(0, min(y, 1))
+                ww = max(0, min(ww, 1 - x))
+                hh = max(0, min(hh, 1 - y))
+//                y = 1 - y - hh
+
+                // 先构造 dst 坐标系（像素）下的框 boxDst
+                let boxDst: CGRect
+                switch boxSpace {
+                case .dstSquare:
+                    // x/y/w/h 相对 dst×dst（含 padding）
+                    boxDst = CGRect(
+                        x: x * CGFloat(dst),
+                        y: y * CGFloat(dst),
+                        width: ww * CGFloat(dst),
+                        height: hh * CGFloat(dst)
+                    )
+
+                case .roiContent:
+                    // x/y/w/h 相对 roi 内容区（不含 padding）
+                    boxDst = CGRect(
+                        x: r.roi.x + x * r.roi.width,
+                        y: r.roi.y + y * r.roi.height,
+                        width: ww * r.roi.width,
+                        height: hh * r.roi.height
+                    )
+                }
+
+                // dst -> 原图像素（去 padding 并映射回原图）
+                let boxSrcPx = ImageUtils.mapBoxFromDstToSource(
+                    boxDst: boxDst,
+                    roi: r.roi,
+                    srcSize: r.srcPixelSize
+                )
+
+                // 原图像素 -> 原图归一化（给 scaledToFit overlay 用）
                 let rectNorm = CGRect(
                     x: boxSrcPx.minX / max(r.srcPixelSize.width, 1),
                     y: boxSrcPx.minY / max(r.srcPixelSize.height, 1),
                     width: boxSrcPx.width / max(r.srcPixelSize.width, 1),
                     height: boxSrcPx.height / max(r.srcPixelSize.height, 1)
                 )
+
                 mapped.append((rectNorm, label, score.floatValue))
             }
 
+
             DispatchQueue.main.async {
                 self.dets = mapped
-                self.status = "完成：\(mapped.count) 个目标"
+                self.status = "完成：\(mapped.count) 个目标（dst=\(dst)）"
             }
         }
     }
@@ -289,6 +432,8 @@ struct ImageDetectScreen: View {
                 if let img = vm.picked {
                     GeometryReader { geo in
                         ZStack {
+//                            let showImg = (vm.showDebugInput ? (vm.debugInput ?? img) : img)
+
                             Image(uiImage: img)
                                 .resizable()
                                 .scaledToFit()
@@ -302,10 +447,13 @@ struct ImageDetectScreen: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .frame(height: 420)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.horizontal, 14)
 
+
             HStack(spacing: 12) {
+//                Toggle("显示模型输入(pb)", isOn: $vm.showDebugInput)
+//                    .padding(.horizontal, 14)
                 PhotosPicker(selection: $pickerItem, matching: .images) {
                     Text("选择照片")
                         .font(.system(size: 16, weight: .semibold))

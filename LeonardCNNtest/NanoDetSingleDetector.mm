@@ -1,10 +1,7 @@
 //
-//  NanoDetSingleDetector.m
+//  NanoDetSingleDetector.mm
 //  LeonardCNNtest
 //
-//  Created by 陳暄暢 on 25/12/2025.
-//
-
 
 #import "NanoDetSingleDetector.h"
 
@@ -14,9 +11,34 @@
 
 #include <memory>
 #include <vector>
-#include <string>
 #include <algorithm>
 #include <cmath>
+
+// -----------------------------
+// Tunables（先强收敛，防止“海量高分框”）
+// -----------------------------
+static constexpr float CONF_THR        = 0.45f; // 先 0.45 压住；后续可调 0.25~0.45
+static constexpr float NMS_THR_CLASS   = 0.45f;
+static constexpr float NMS_THR_AGN     = 0.50f;
+static constexpr bool  ENABLE_AGN_NMS  = true;
+
+static constexpr int   PRE_NMS_TOPK    = 300;
+static constexpr int   PER_CLASS_TOPK  = 50;
+static constexpr int   FINAL_TOPN      = 20;
+static constexpr float MIN_BOX_PX      = 12.f;  // 在输入尺寸坐标系里过滤碎框（12/16 可试）
+
+// -----------------------------
+// Helpers
+// -----------------------------
+static inline float sigmoid_stable(float x) {
+    if (x >= 0.f) { float z = std::exp(-x); return 1.f / (1.f + z); }
+    else { float z = std::exp(x); return z / (1.f + z); }
+}
+static inline float sigmoid_safe(float x) {
+    // 若已经是 0~1 概率，避免重复 sigmoid 导致 100%+ / 分布异常
+    if (x >= 0.f && x <= 1.f) return x;
+    return sigmoid_stable(x);
+}
 
 struct BoxInfo {
     float x1, y1, x2, y2;
@@ -24,76 +46,58 @@ struct BoxInfo {
     int label;
 };
 
-struct CenterPrior {
-    int x;
-    int y;
-    int stride;
-};
-
-// ---- demo fast_exp/sigmoid/softmax（保持一致）----
-static inline float fast_exp(float x) {
-    union { uint32_t i; float f; } v{};
-    v.i = (1u << 23) * (1.4426950409f * x + 126.93490512f);
-    return v.f;
+static inline float iou(const BoxInfo& a, const BoxInfo& b) {
+    float xx1 = std::max(a.x1, b.x1);
+    float yy1 = std::max(a.y1, b.y1);
+    float xx2 = std::min(a.x2, b.x2);
+    float yy2 = std::min(a.y2, b.y2);
+    float w = std::max(0.f, xx2 - xx1);
+    float h = std::max(0.f, yy2 - yy1);
+    float inter = w * h;
+    float areaA = std::max(0.f, a.x2 - a.x1) * std::max(0.f, a.y2 - a.y1);
+    float areaB = std::max(0.f, b.x2 - b.x1) * std::max(0.f, b.y2 - b.y1);
+    float uni = areaA + areaB - inter;
+    return (uni <= 0.f) ? 0.f : (inter / uni);
 }
 
-static inline void softmax(const float* src, float* dst, int length) {
-    float alpha = src[0];
-    for (int i = 1; i < length; ++i) alpha = std::max(alpha, src[i]);
-
-    float denom = 0.f;
-    for (int i = 0; i < length; ++i) {
-        dst[i] = fast_exp(src[i] - alpha);
-        denom += dst[i];
-    }
-    float inv = denom > 0.f ? 1.f / denom : 0.f;
-    for (int i = 0; i < length; ++i) dst[i] *= inv;
-}
-
-// demo 的 center priors 生成
-static void generate_grid_center_priors(int input_h, int input_w,
-                                        const std::vector<int>& strides,
-                                        std::vector<CenterPrior>& out) {
-    out.clear();
-    for (int stride : strides) {
-        int feat_w = (int)std::ceil((float)input_w / (float)stride);
-        int feat_h = (int)std::ceil((float)input_h / (float)stride);
-        for (int y = 0; y < feat_h; y++) {
-            for (int x = 0; x < feat_w; x++) {
-                out.push_back(CenterPrior{x, y, stride});
-            }
-        }
-    }
-}
-
-// demo 的 NMS（带 +1 的面积/交并）
-static void nms(std::vector<BoxInfo>& boxes, float nmsThr) {
+// per-class NMS（同类抑制）
+static void nms_per_class(std::vector<BoxInfo>& boxes, float thr) {
     std::sort(boxes.begin(), boxes.end(), [](const BoxInfo& a, const BoxInfo& b){ return a.score > b.score; });
-    std::vector<float> areas(boxes.size());
-    for (int i = 0; i < (int)boxes.size(); ++i) {
-        areas[i] = (boxes[i].x2 - boxes[i].x1 + 1.f) * (boxes[i].y2 - boxes[i].y1 + 1.f);
-    }
-    for (int i = 0; i < (int)boxes.size(); ++i) {
-        for (int j = i + 1; j < (int)boxes.size(); ) {
-            float xx1 = std::max(boxes[i].x1, boxes[j].x1);
-            float yy1 = std::max(boxes[i].y1, boxes[j].y1);
-            float xx2 = std::min(boxes[i].x2, boxes[j].x2);
-            float yy2 = std::min(boxes[i].y2, boxes[j].y2);
-            float w = std::max(0.f, xx2 - xx1 + 1.f);
-            float h = std::max(0.f, yy2 - yy1 + 1.f);
-            float inter = w * h;
-            float ovr = inter / (areas[i] + areas[j] - inter);
-            if (ovr >= nmsThr) {
-                boxes.erase(boxes.begin() + j);
-                areas.erase(areas.begin() + j);
-            } else {
-                j++;
-            }
+    std::vector<bool> removed(boxes.size(), false);
+    std::vector<BoxInfo> kept;
+    kept.reserve(boxes.size());
+
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        if (removed[i]) continue;
+        kept.push_back(boxes[i]);
+        for (size_t j = i + 1; j < boxes.size(); ++j) {
+            if (removed[j]) continue;
+            if (boxes[i].label != boxes[j].label) continue;
+            if (iou(boxes[i], boxes[j]) > thr) removed[j] = true;
         }
     }
+    boxes.swap(kept);
 }
 
-// COCO labels（同你 demo）
+// agnostic NMS（跨类去重）
+static void nms_agnostic(std::vector<BoxInfo>& boxes, float thr) {
+    std::sort(boxes.begin(), boxes.end(), [](const BoxInfo& a, const BoxInfo& b){ return a.score > b.score; });
+    std::vector<bool> removed(boxes.size(), false);
+    std::vector<BoxInfo> kept;
+    kept.reserve(boxes.size());
+
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        if (removed[i]) continue;
+        kept.push_back(boxes[i]);
+        for (size_t j = i + 1; j < boxes.size(); ++j) {
+            if (removed[j]) continue;
+            if (iou(boxes[i], boxes[j]) > thr) removed[j] = true;
+        }
+    }
+    boxes.swap(kept);
+}
+
+// COCO 80 labels（默认）
 static NSArray<NSString *> *CocoLabels() {
     static NSArray<NSString *> *labels = nil;
     static dispatch_once_t onceToken;
@@ -112,6 +116,37 @@ static NSArray<NSString *> *CocoLabels() {
     return labels;
 }
 
+// 输出张量视图：统一成 (N boxes, C channels)
+struct OutView {
+    int n = 0;
+    int c = 0;
+    bool boxMajor = true; // true: [n,c]; false: [c,n]
+    const float* ptr = nullptr;
+
+    inline float at(int i, int j) const {
+        return boxMajor ? ptr[i * c + j] : ptr[j * n + i];
+    }
+};
+
+// 支持：[1,n,c] / [1,c,n] / [n,c] / [c,n]
+static inline bool makeOutView(const MNN::Tensor* t, OutView& v) {
+    auto s = t->shape();
+    if (s.size() == 3) {
+        int a = s[1], b = s[2];
+        // heuristic: channel 通常较小（84/85/…）
+        if (b <= 512 && a > b) { v.n = a; v.c = b; v.boxMajor = true;  return true; }   // [n,c]
+        if (a <= 512 && b > a) { v.n = b; v.c = a; v.boxMajor = false; return true; }   // [c,n]
+        v.n = a; v.c = b; v.boxMajor = true; return true;
+    }
+    if (s.size() == 2) {
+        int a = s[0], b = s[1];
+        if (b <= 512 && a > b) { v.n = a; v.c = b; v.boxMajor = true;  return true; }
+        if (a <= 512 && b > a) { v.n = b; v.c = a; v.boxMajor = false; return true; }
+        v.n = a; v.c = b; v.boxMajor = true; return true;
+    }
+    return false;
+}
+
 @implementation NanoDetSingleDetector {
     std::shared_ptr<MNN::Interpreter> _net;
     MNN::Session* _session;
@@ -119,17 +154,14 @@ static NSArray<NSString *> *CocoLabels() {
     MNN::Tensor* _output;
     std::shared_ptr<MNN::CV::ImageProcess> _pretreat;
 
-    std::vector<int> _strides;
-    std::vector<CenterPrior> _centerPriors;
-
     int _inW, _inH;
-    int _numClass;
-    int _regMax;
-
-    float _scoreThr;
-    float _nmsThr;
-
+    BOOL _isNCHW;
+    int _numClass;     // 默认 80（COCO）
     BOOL _ready;
+}
+
+- (int)inputSize {
+    return _ready ? _inW : 416;
 }
 
 - (instancetype)init {
@@ -137,189 +169,295 @@ static NSArray<NSString *> *CocoLabels() {
     if (!self) return nil;
 
     _ready = NO;
-
-    // 按 demo 配置
-    _inW = 416; _inH = 416;
     _numClass = 80;
-    _regMax = 7;
-    _strides = {8,16,32,64};
 
-    // demo main.cpp: score=0.45, nms=0.3
-    _scoreThr = 0.45f;
-    _nmsThr = 0.30f;
-
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"nanodet-plus-m_416_mnn" ofType:@"mnn"];
+    // 1) 改成你的 YOLO 模型文件名（不带扩展名）
+    //    例如：yolo11n_640.mnn / yolov5n_640.mnn
+    NSString *path = [[NSBundle mainBundle] pathForResource:@"yolo11n_640" ofType:@"mnn"];
     if (!path) {
-        NSLog(@"[NanoDetSingleDetector] model not found in bundle");
+        NSLog(@"[YOLOSingleDetector] model not found in bundle");
         return self;
     }
 
     _net.reset(MNN::Interpreter::createFromFile(path.UTF8String));
     if (!_net) {
-        NSLog(@"[NanoDetSingleDetector] createFromFile failed");
+        NSLog(@"[YOLOSingleDetector] createFromFile failed");
         return self;
     }
 
+    // 放在 init 里，createSession 之前
+
+    MNN::BackendConfig backendConfig;
+    backendConfig.precision = MNN::BackendConfig::Precision_Low;   // FP16，速度更快
+    backendConfig.power     = MNN::BackendConfig::Power_High;
+    backendConfig.memory    = MNN::BackendConfig::Memory_High;
+
     MNN::ScheduleConfig cfg;
-    cfg.type = MNN_FORWARD_CPU;
-    cfg.numThread = 4;
+    cfg.type = MNN_FORWARD_METAL;          // GPU: Metal
+    cfg.backupType = MNN_FORWARD_CPU;      // Metal 不可用则回落 CPU
+    cfg.numThread = 4;                     // 仅对 backup CPU 有意义
+    cfg.backendConfig = &backendConfig;
 
     _session = _net->createSession(cfg);
     if (!_session) {
-        NSLog(@"[NanoDetSingleDetector] createSession failed");
+        NSLog(@"[MNNDetector] createSession METAL failed, fallback to CPU");
+        MNN::ScheduleConfig cpuCfg;
+        cpuCfg.type = MNN_FORWARD_CPU;
+        cpuCfg.numThread = 4;
+        _session = _net->createSession(cpuCfg);
+    }
+
+    if (!_session) {
+        NSLog(@"[YOLOSingleDetector] createSession failed");
         return self;
     }
 
     _input = _net->getSessionInput(_session, nullptr);
     if (!_input) {
-        NSLog(@"[NanoDetSingleDetector] getSessionInput failed");
+        NSLog(@"[YOLOSingleDetector] getSessionInput failed");
         return self;
     }
 
-    // demo：input_name="data", output_name="output"；你目前模型输出名就是 output
+    // 输出名不一定叫 output：优先 "output"，拿不到就取第一个
     _output = _net->getSessionOutput(_session, "output");
     if (!_output) {
-        NSLog(@"[NanoDetSingleDetector] getSessionOutput('output') failed");
+        auto outs = _net->getSessionOutputAll(_session);
+        if (!outs.empty()) _output = outs.begin()->second;
+    }
+    if (!_output) {
+        NSLog(@"[YOLOSingleDetector] getSessionOutput failed");
         return self;
     }
 
-    // 固定输入尺寸
-    _net->resizeTensor(_input, {1, 3, _inH, _inW});
-    _net->resizeSession(_session);
+    // 2) 从 input shape 推断输入尺寸 + layout
+    {
+        auto s = _input->shape(); // 常见 [1,3,H,W] 或 [1,H,W,3]
+        _isNCHW = YES;
+        _inW = 640; _inH = 640;
 
-    // 预处理：BGRA -> BGR + mean/norm（和 nanodet_mnn.hpp 一致）
+        if (s.size() == 4) {
+            if (s[1] == 3) { _isNCHW = YES;  _inH = s[2]; _inW = s[3]; }
+            else if (s[3] == 3) { _isNCHW = NO; _inH = s[1]; _inW = s[2]; }
+        }
+    }
+
+    // 3) preprocess：BGRA -> RGB，归一化 /255（Ultralytics YOLO 常用）
     MNN::CV::ImageProcess::Config icfg;
     ::memset(&icfg, 0, sizeof(icfg));
-    icfg.filterType = MNN::CV::BILINEAR;
+    icfg.filterType   = MNN::CV::BILINEAR;
     icfg.sourceFormat = MNN::CV::BGRA;
-    icfg.destFormat = MNN::CV::BGR;
+    icfg.destFormat   = MNN::CV::RGB;
 
-    // mean_vals: {103.53,116.28,123.675}
-    icfg.mean[0] = 103.53f;  icfg.mean[1] = 116.28f;  icfg.mean[2] = 123.675f; icfg.mean[3] = 0.f;
-    // norm_vals: {0.017429,0.017507,0.017125}
-    icfg.normal[0] = 0.017429f; icfg.normal[1] = 0.017507f; icfg.normal[2] = 0.017125f; icfg.normal[3] = 1.f;
+    icfg.mean[0] = 0.f; icfg.mean[1] = 0.f; icfg.mean[2] = 0.f; icfg.mean[3] = 0.f;
+
+    // 如果你的 MNN 头文件里没有 normal 字段而是 norm，请把 normal 改成 norm
+    icfg.normal[0] = 1.f/255.f; icfg.normal[1] = 1.f/255.f; icfg.normal[2] = 1.f/255.f; icfg.normal[3] = 1.f;
 
     _pretreat.reset(MNN::CV::ImageProcess::create(icfg));
     if (!_pretreat) {
-        NSLog(@"[NanoDetSingleDetector] ImageProcess create failed");
+        NSLog(@"[YOLOSingleDetector] ImageProcess create failed");
         return self;
     }
 
-    // center priors 只生成一次
-    generate_grid_center_priors(_inH, _inW, _strides, _centerPriors);
-    NSLog(@"[NanoDetSingleDetector] priors=%d", (int)_centerPriors.size()); // 期望 3598
-
     _net->releaseModel();
     _ready = YES;
+
+    NSLog(@"[YOLOSingleDetector] ready=YES, input=%dx%d layout=%s",
+          _inW, _inH, _isNCHW ? "NCHW" : "NHWC");
     return self;
 }
 
 - (NSArray<NSDictionary *> *)detectWithPixelBuffer:(CVPixelBufferRef)pixelBuffer {
     if (!_ready || !pixelBuffer) return @[];
 
-    // 要求 Swift 输入已是 416x416；如果不是也能跑，但建议你按我给的 Swift resize_uniform
-    const int srcW = (int)CVPixelBufferGetWidth(pixelBuffer);
-    const int srcH = (int)CVPixelBufferGetHeight(pixelBuffer);
+    int srcW = (int)CVPixelBufferGetWidth(pixelBuffer);
+    int srcH = (int)CVPixelBufferGetHeight(pixelBuffer);
+
+    // Swift 侧应当先 resize_uniform 到 inputSize×inputSize；不一致也能跑，但会影响对齐
     if (srcW != _inW || srcH != _inH) {
-        NSLog(@"[NanoDetSingleDetector] warning: pixelBuffer=%dx%d, expect=%dx%d", srcW, srcH, _inW, _inH);
+        NSLog(@"[YOLOSingleDetector] warning: pixelBuffer=%dx%d, expect=%dx%d",
+              srcW, srcH, _inW, _inH);
     }
 
+    // 1) preprocess
     CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     uint8_t* base = (uint8_t*)CVPixelBufferGetBaseAddress(pixelBuffer);
-    int stride = (int)CVPixelBufferGetBytesPerRow(pixelBuffer);
+    int bpr = (int)CVPixelBufferGetBytesPerRow(pixelBuffer);
 
-    // matrix identity（因为 Swift 已经做了 416x416）
-    MNN::CV::Matrix m;
+    MNN::CV::Matrix m; // identity（你已经在 Swift resize_uniform 到正确尺寸）
     _pretreat->setMatrix(m);
-    _pretreat->convert(base, srcW, srcH, stride, _input);
+    _pretreat->convert(base, srcW, srcH, bpr, _input);
 
     CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
-    // 推理
+    // 2) infer
     _net->runSession(_session);
 
-    // output -> host
+    // 3) output -> host
     std::shared_ptr<MNN::Tensor> outHost(MNN::Tensor::createHostTensorFromDevice(_output, true));
-    const float* pred = outHost->host<float>();
-    auto shp = outHost->shape(); // [1,3598,112]
+    const float* outPtr = outHost->host<float>();
+    if (!outPtr) return @[];
 
-    const int bins = _regMax + 1;          // 8
-    const int numCh = _numClass + 4*bins;  // 112
-
-    if (shp.size() != 3 || shp[1] != (int)_centerPriors.size() || shp[2] != numCh) {
-        NSLog(@"[NanoDetSingleDetector] unexpected output shape");
+    OutView ov;
+    if (!makeOutView(outHost.get(), ov)) {
+        NSLog(@"[YOLOSingleDetector] unsupported output shape");
         return @[];
     }
+    ov.ptr = outPtr;
 
-    // per-class results
-    std::vector<std::vector<BoxInfo>> results;
-    results.resize(_numClass);
+    // 4) decode
+    std::vector<BoxInfo> cands;
+    cands.reserve(512);
 
-    float sm[8];
+    // 情况 A：导出时已带 NMS，常见 [N,6] => x1,y1,x2,y2,score,cls
+    if (ov.c == 6) {
+        for (int i = 0; i < ov.n; ++i) {
+            float x1 = ov.at(i,0), y1 = ov.at(i,1), x2 = ov.at(i,2), y2 = ov.at(i,3);
+            float sc = ov.at(i,4);
+            int   cl = (int)ov.at(i,5);
 
-    // demo decode_infer：max score（不 sigmoid），center= x*stride/y*stride
-    const int numPoints = (int)_centerPriors.size();
-    for (int idx = 0; idx < numPoints; ++idx) {
-        const CenterPrior& ct = _centerPriors[idx];
-        const float* scores = pred + idx * numCh;
+            // 兼容归一化坐标
+            if (x2 <= 1.5f && y2 <= 1.5f) {
+                x1 *= _inW; x2 *= _inW;
+                y1 *= _inH; y2 *= _inH;
+            }
 
-        float bestScore = 0.f;
-        int bestLabel = 0;
-        for (int c = 0; c < _numClass; ++c) {
-            if (scores[c] > bestScore) {
-                bestScore = scores[c];
-                bestLabel = c;
+            float bw = x2 - x1, bh = y2 - y1;
+            if (sc < CONF_THR) continue;
+            if (bw < MIN_BOX_PX || bh < MIN_BOX_PX) continue;
+
+            cands.push_back(BoxInfo{
+                std::max(0.f,x1), std::max(0.f,y1),
+                std::min((float)_inW,x2), std::min((float)_inH,y2),
+                std::min(std::max(sc,0.f),1.f), cl
+            });
+        }
+    } else {
+        // 情况 B：raw 输出
+        // YOLO11/8: C = 4 + numClass（常见 84）
+        // YOLOv5:   C = 4 + 1 + numClass（常见 85）
+        int C = ov.c;
+
+        bool hasObj = false;
+        int numClass = 0;
+
+        if (C == 85) { hasObj = true; numClass = 80; }
+        else if (C == 84) { hasObj = false; numClass = 80; }
+        else {
+            // 泛化：优先按 4+cls
+            hasObj = false;
+            numClass = C - 4;
+            // 如果 4+1+cls 更合理（cls 在 1~300），可以改成 hasObj
+            if (C - 5 >= 1 && C - 5 <= 300 && (C - 4 > 300)) {
+                hasObj = true; numClass = C - 5;
             }
         }
-        if (bestScore <= _scoreThr) continue;
 
-        const float* bboxPred = scores + _numClass; // 32 floats
-        float dis[4];
+        // 如果你不是 COCO 80 类，这里会变；Swift 端 label 显示也要换
+        _numClass = numClass;
 
-        for (int s = 0; s < 4; ++s) {
-            softmax(bboxPred + s*bins, sm, bins);
-            float expv = 0.f;
-            for (int b = 0; b < bins; ++b) expv += sm[b] * (float)b;
-            dis[s] = expv * (float)ct.stride;
+        for (int i = 0; i < ov.n; ++i) {
+            float cx = ov.at(i, 0);
+            float cy = ov.at(i, 1);
+            float w  = ov.at(i, 2);
+            float h  = ov.at(i, 3);
+
+            // 兼容归一化输出
+            if (cx <= 1.5f && cy <= 1.5f && w <= 1.5f && h <= 1.5f) {
+                cx *= _inW; cy *= _inH;
+                w  *= _inW; h  *= _inH;
+            }
+
+            float bestS = 0.f;
+            int bestC = -1;
+
+            if (hasObj) {
+                float obj = sigmoid_safe(ov.at(i, 4));
+                for (int c = 0; c < numClass; ++c) {
+                    float cls = sigmoid_safe(ov.at(i, 5 + c));
+                    float s = obj * cls;
+                    if (s > bestS) { bestS = s; bestC = c; }
+                }
+            } else {
+                for (int c = 0; c < numClass; ++c) {
+                    float s = sigmoid_safe(ov.at(i, 4 + c));
+                    if (s > bestS) { bestS = s; bestC = c; }
+                }
+            }
+
+            if (bestC < 0 || bestS < CONF_THR) continue;
+
+            float x1 = cx - w * 0.5f;
+            float y1 = cy - h * 0.5f;
+            float x2 = cx + w * 0.5f;
+            float y2 = cy + h * 0.5f;
+
+            x1 = std::max(0.f, x1); y1 = std::max(0.f, y1);
+            x2 = std::min((float)_inW, x2); y2 = std::min((float)_inH, y2);
+
+            float bw = x2 - x1, bh = y2 - y1;
+            if (bw < MIN_BOX_PX || bh < MIN_BOX_PX) continue;
+
+            cands.push_back(BoxInfo{x1,y1,x2,y2,bestS,bestC});
         }
-
-        float cx = (float)ct.x * (float)ct.stride;
-        float cy = (float)ct.y * (float)ct.stride;
-
-        float x1 = std::max(cx - dis[0], 0.f);
-        float y1 = std::max(cy - dis[1], 0.f);
-        float x2 = std::min(cx + dis[2], (float)_inW);
-        float y2 = std::min(cy + dis[3], (float)_inH);
-
-        results[bestLabel].push_back(BoxInfo{x1,y1,x2,y2,bestScore,bestLabel});
     }
 
-    // NMS + pack output
-    NSMutableArray* arr = [NSMutableArray array];
+    if (cands.empty()) return @[];
+
+    // 5) pre-nms topK
+    std::sort(cands.begin(), cands.end(), [](const BoxInfo& a, const BoxInfo& b){ return a.score > b.score; });
+    if ((int)cands.size() > PRE_NMS_TOPK) cands.resize(PRE_NMS_TOPK);
+
+    // 6) per-class topK + per-class NMS
+    int numClassForBucket = std::max(_numClass, 1);
+    std::vector<std::vector<BoxInfo>> buckets(numClassForBucket);
+    for (auto& b : cands) {
+        if (b.label >= 0 && b.label < numClassForBucket) buckets[b.label].push_back(b);
+    }
+
+    std::vector<BoxInfo> merged;
+    merged.reserve(256);
+
+    for (int c = 0; c < numClassForBucket; ++c) {
+        auto& v = buckets[c];
+        if (v.empty()) continue;
+
+        std::sort(v.begin(), v.end(), [](const BoxInfo& a, const BoxInfo& b){ return a.score > b.score; });
+        if ((int)v.size() > PER_CLASS_TOPK) v.resize(PER_CLASS_TOPK);
+
+        nms_per_class(v, NMS_THR_CLASS);
+        merged.insert(merged.end(), v.begin(), v.end());
+    }
+
+    if (merged.empty()) return @[];
+
+    // 7) optional agnostic NMS + final topN
+    if (ENABLE_AGN_NMS) {
+        nms_agnostic(merged, NMS_THR_AGN);
+    }
+    std::sort(merged.begin(), merged.end(), [](const BoxInfo& a, const BoxInfo& b){ return a.score > b.score; });
+    if ((int)merged.size() > FINAL_TOPN) merged.resize(FINAL_TOPN);
+
+    // 8) pack output (normalize to 0~1 in input space)
     NSArray<NSString*>* labels = CocoLabels();
+    NSMutableArray* arr = [NSMutableArray arrayWithCapacity:merged.size()];
 
-    for (int c = 0; c < _numClass; ++c) {
-        auto& vec = results[c];
-        if (vec.empty()) continue;
-        nms(vec, _nmsThr);
+    for (const auto& b : merged) {
+        float w = std::max(0.f, b.x2 - b.x1);
+        float h = std::max(0.f, b.y2 - b.y1);
 
-        for (const auto& b : vec) {
-            float w = std::max(0.f, b.x2 - b.x1);
-            float h = std::max(0.f, b.y2 - b.y1);
+        NSString* name = (b.label >= 0 && b.label < (int)labels.count)
+            ? labels[b.label]
+            : [NSString stringWithFormat:@"cls_%d", b.label];
 
-            NSString* name = (b.label >= 0 && b.label < (int)labels.count) ? labels[b.label] : [NSString stringWithFormat:@"cls_%d", b.label];
-
-            // 输出归一化到 0~1（相对 416x416），方便 Swift 端复用
-            NSDictionary* d = @{
-                @"x": @(b.x1 / (float)_inW),
-                @"y": @(b.y1 / (float)_inH),
-                @"w": @(w    / (float)_inW),
-                @"h": @(h    / (float)_inH),
-                @"label": name,
-                @"score": @(b.score)
-            };
-            [arr addObject:d];
-        }
+        [arr addObject:@{
+            @"x": @(b.x1 / (float)_inW),
+            @"y": @(b.y1 / (float)_inH),
+            @"w": @(w    / (float)_inW),
+            @"h": @(h    / (float)_inH),
+            @"label": name,
+            @"score": @(std::min(std::max(b.score, 0.f), 1.f))
+        }];
     }
 
     return arr;

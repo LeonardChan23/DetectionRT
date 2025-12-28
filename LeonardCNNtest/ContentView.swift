@@ -1,21 +1,14 @@
-//
-//  ContentView.swift
-//  LeonardCNNtest
-//
-//  Created by 陳暄暢 on 24/12/2025.
-//
-
 import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        TabView {
+            CameraScreen()
+                .tabItem { Label("Camera", systemImage: "camera") }
+
+            ImageDetectScreen()
+                .tabItem { Label("Photo", systemImage: "photo") }
         }
-        .padding()
     }
 }
 
