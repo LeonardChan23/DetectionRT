@@ -564,7 +564,7 @@ struct CameraScreen: View {
             // Top bar
             VStack(spacing: 0) {
                 HStack {
-                    Text(vm.isRunning ? "Running" : "Stopped")
+                    Text(vm.isRunning ? "camera.Running" : "camera.Stopped")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
@@ -585,16 +585,15 @@ struct CameraScreen: View {
 //                        .padding(.vertical, 6)
 //                        .background(.black.opacity(0.55))
 //                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                    Text(String(format: "Camera \n%.1ffps", vm.camFPS))
-                        .font(.system(size: 14, weight: .semibold))
+                    Text(verbatim: String(format: NSLocalizedString("camera_fps", comment: "camera FPS label"), locale: .current, vm.camFPS))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
                         .background(.black.opacity(0.55))
                         .clipShape(RoundedRectangle(cornerRadius: 10))
 
-                    Text(String(format: "Inference \n%.1ffps", vm.infFPS))
-                        .font(.system(size: 14, weight: .semibold))
+                    Text(verbatim: String(format: NSLocalizedString("inference_fps", comment: "inference FPS label"), locale: .current, vm.infFPS))
+//                        .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
@@ -621,11 +620,11 @@ struct CameraScreen: View {
                     Button {
                         vm.isRunning ? vm.stop() : vm.start()
                     } label: {
-                        Text(vm.isRunning ? "Stop" : "Start")
+                        Text(vm.isRunning ? "camera.Stop" : "camera.Start")
                             .font(.system(size: 16, weight: .semibold))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 14)
-                            .background(.black.opacity(0.65))
+                            .background(.orange.opacity(0.65))
                             .foregroundStyle(.white)
                             .clipShape(RoundedRectangle(cornerRadius: 14))
                     }
@@ -637,10 +636,10 @@ struct CameraScreen: View {
             // Permission denied overlay
             if vm.permission == .denied {
                 VStack(spacing: 10) {
-                    Text("无法使用摄像头")
+                    Text("camera.unusable")
                         .font(.system(size: 18, weight: .bold))
                         .foregroundStyle(.white)
-                    Text("请在系统设置中允许相机权限，然后重新打开 App。")
+                    Text("allow.camera")
                         .font(.system(size: 14))
                         .foregroundStyle(.white.opacity(0.9))
                 }

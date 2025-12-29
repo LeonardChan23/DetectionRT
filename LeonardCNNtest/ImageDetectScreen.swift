@@ -260,7 +260,7 @@ final class ImageDetectVM: ObservableObject {
     // ✅ 默认：中心点 + 相对 dst×dst
     private let boxSpace: BoxNormSpace = .dstSquare
     
-    @Published var status: String = "请选择一张图片"
+    @Published var status: String = NSLocalizedString("single.status.pick", comment: "pick a image")
     @Published var picked: UIImage? = nil
     @Published var dets: [(rectNorm: CGRect, label: String, score: Float)] = []
 
@@ -279,10 +279,10 @@ final class ImageDetectVM: ObservableObject {
         if let r = ImageUtils.resizeUniform(up, dst: dst) {
             roi = r.roi
             srcPixelSize = r.srcPixelSize
-            status = "可开始检测（dst=\(dst) roi: x=\(Int(r.roi.x)) y=\(Int(r.roi.y)) w=\(Int(r.roi.width)) h=\(Int(r.roi.height)))"
+            status = String(format: NSLocalizedString("single.status.ready", comment: "ready for detection"), locale: .current,dst, Int(r.roi.x), Int(r.roi.y), Int(r.roi.width), Int(r.roi.height))
         } else {
             roi = nil
-            status = "图片处理失败"
+            status = NSLocalizedString("single.status.failed", comment: "fail to load image")
         }
     }
 
@@ -294,7 +294,7 @@ final class ImageDetectVM: ObservableObject {
         let dst = Int(detector.inputSize)   // ✅ 关键：跟随模型输入尺寸
 
         guard let r = ImageUtils.resizeUniform(img, dst: dst) else {
-            status = "resize_uniform 失败"
+            status = NSLocalizedString("single.status.failed.resize", comment: "fail to resize uniform")
             return
         }
 
@@ -303,7 +303,7 @@ final class ImageDetectVM: ObservableObject {
         print("[DBG] ui.cgImage(px)=\(r.ui.cgImage?.width ?? -1)x\(r.ui.cgImage?.height ?? -1)")
 
         guard let pb = ImageUtils.pixelBufferBGRA(from: r.ui, dst: dst) else {
-            status = "PixelBuffer 创建失败"
+            status = NSLocalizedString("single.status.failed.pxbuffer", comment: "fail to create pixel buffer")
             return
         }
 
@@ -319,12 +319,12 @@ final class ImageDetectVM: ObservableObject {
         let ph = CVPixelBufferGetHeight(pb)
         print("[DBG] pb=\(pw)x\(ph)")
 
-        if pw != dst || ph != dst {
-            status = "内部错误：pb=\(pw)x\(ph)，不是 \(dst)x\(dst)"
-            return
-        }
+//        if pw != dst || ph != dst {
+//            status = "内部错误：pb=\(pw)x\(ph)，不是 \(dst)x\(dst)"
+//            return
+//        }
 
-        status = "检测中…"
+        status = NSLocalizedString("single.status.running", comment: "detecting")
         dets = []
 
         q.async { [weak self] in
@@ -405,7 +405,7 @@ final class ImageDetectVM: ObservableObject {
 
             DispatchQueue.main.async {
                 self.dets = mapped
-                self.status = "完成：\(mapped.count) 个目标（dst=\(dst)）"
+                self.status = String.localizedStringWithFormat(           NSLocalizedString("single.status.done", comment: "Detection finished status"), mapped.count, dst)
             }
         }
     }
@@ -419,7 +419,7 @@ struct ImageDetectScreen: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Text(vm.status)
+            Text(verbatim: vm.status)
                 .font(.system(size: 14, weight: .semibold))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 14)
@@ -443,7 +443,7 @@ struct ImageDetectScreen: View {
                         }
                     }
                 } else {
-                    Text("未选择图片")
+                    Text("No.photo")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -455,11 +455,11 @@ struct ImageDetectScreen: View {
 //                Toggle("显示模型输入(pb)", isOn: $vm.showDebugInput)
 //                    .padding(.horizontal, 14)
                 PhotosPicker(selection: $pickerItem, matching: .images) {
-                    Text("选择照片")
+                    Text("Choose.photo")
                         .font(.system(size: 16, weight: .semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 12)
-                        .background(.black.opacity(0.75))
+                        .background(.orange.opacity(0.75))
                         .foregroundStyle(.white)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                 }
@@ -467,7 +467,7 @@ struct ImageDetectScreen: View {
                 Button {
                     vm.detectOnce()
                 } label: {
-                    Text("检测一次")
+                    Text("SingleDetect.Once")
                         .font(.system(size: 16, weight: .semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 12)
@@ -488,7 +488,7 @@ struct ImageDetectScreen: View {
                    let image = UIImage(data: data) {
                     vm.setImage(image)
                 } else {
-                    vm.status = "读取照片失败"
+                    vm.status = NSLocalizedString("single.status.failed", comment: "fail to load image")
                 }
             }
         }
