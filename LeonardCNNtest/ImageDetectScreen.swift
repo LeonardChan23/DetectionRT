@@ -9,6 +9,8 @@ import SwiftUI
 import PhotosUI
 import AVFoundation
 import Combine
+import ImageIO
+
 
 // effect_roi 对应 demo 里的 object_rect：在 dst×dst 坐标系中，真实内容区域（去掉 padding）
 struct EffectROI {
@@ -19,6 +21,28 @@ struct EffectROI {
 }
 
 enum ImageUtils {
+    static func imagePixelSize(from data: Data) -> CGSize {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? CGFloat,
+              let h = props[kCGImagePropertyPixelHeight] as? CGFloat else {
+            return .init(width: 1, height: 1)
+        }
+        return .init(width: w, height: h)
+    }
+
+    static func downsample(data: Data, maxPixel: CGFloat) -> UIImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: CFDictionary = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
     static func uiImageRaw(from pixelBuffer: CVPixelBuffer) -> UIImage? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
@@ -250,6 +274,13 @@ final class ImageDetectVM: ObservableObject {
         case dstSquare   // x/y/w/h 是相对 dst×dst（含 padding）
         case roiContent  // x/y/w/h 是相对 roi 内容区（不含 padding）
     }
+    
+    private var thumbTasks: [UUID: Task<Void, Never>] = [:]
+    private var previewTasks: [UUID: Task<Void, Never>] = [:]
+    private var detectTasks: [UUID: Task<Void, Never>] = [:]
+
+    private let thumbMaxPixel: CGFloat = 256
+    private let previewMaxPixel: CGFloat = 2048
 
     // ✅ 默认：相对 dst×dst（含 padding）
     private let boxSpace: BoxNormSpace = .dstSquare
@@ -264,10 +295,22 @@ final class ImageDetectVM: ObservableObject {
 
     struct DetectItem: Identifiable {
         let id = UUID()
-        let image: UIImage
-        var prepared: Prepared?
+        let pickerItem: PhotosPickerItem
+
+        // 懒加载缓存
+        var thumb: UIImage? = nil        // 例如 256px
+        var preview: UIImage? = nil      // 例如 1536~2048px（用于预览/叠框）
+        var previewPixelSize: CGSize = .init(width: 1, height: 1)
+
+        var isLoadingThumb = false
+        var isLoadingPreview = false
+
+        // 检测结果与状态
         var dets: [(rectNorm: CGRect, label: String, score: Float)] = []
         var status: String = ""
+
+        // 可选：缓存一次预处理结果（dst 输入 & roi 映射信息），重复检测更快
+        var prepared: Prepared? = nil
     }
 
     @Published var items: [DetectItem] = []
@@ -312,41 +355,16 @@ final class ImageDetectVM: ObservableObject {
     private var batchIDs: [UUID] = []
     private var batchRunID: UUID = UUID()
 
-    // MARK: - Public APIs
-
-    func setImage(_ img: UIImage) {
-        setImages([img])
-    }
-
-    func setImages(_ images: [UIImage]) {
-        // 选新图时，先终止旧批量
+    
+    func setPickerItems(_ pickerItems: [PhotosPickerItem]) {
         cancelBatchInternal(setState: false)
 
-        let dst = Int(detector.inputSize)
-
-        var newItems: [DetectItem] = []
-        newItems.reserveCapacity(images.count)
-
-        for img in images {
-            let up = ImageUtils.normalizedUp(img)
-            var item = DetectItem(image: up)
-
-            if let r = ImageUtils.resizeUniform(up, dst: dst) {
-                let prepared = Prepared(ui: r.ui, roi: r.roi, srcPixelSize: r.srcPixelSize)
-                item.prepared = prepared
-                item.status = String(
-                    format: NSLocalizedString("single.status.ready", comment: "ready for detection"),
-                    locale: .current,
-                    dst, Int(r.roi.x), Int(r.roi.y), Int(r.roi.width), Int(r.roi.height)
-                )
-            } else {
-                item.prepared = nil
-                item.status = NSLocalizedString("single.status.failed", comment: "fail to load image")
-            }
-            newItems.append(item)
+        items = pickerItems.map {
+            var it = DetectItem(pickerItem: $0)
+            it.status = NSLocalizedString("single.status.loading", comment: "loading")
+            return it
         }
 
-        items = newItems
         selectedID = items.first?.id
         syncSelectedToPreview()
 
@@ -355,11 +373,109 @@ final class ImageDetectVM: ObservableObject {
         batchDone = 0
         batchCurrent = 0
         batchState = items.isEmpty ? .idle : .ready
+
+        if let id = selectedID {
+            ensureThumbLoaded(id: id)
+            ensurePreviewLoaded(id: id)
+            prefetchNeighbors(around: id, keepAround: 30)
+        }
     }
 
+    func ensureThumbLoaded(id: UUID) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        if items[idx].thumb != nil || items[idx].isLoadingThumb { return }
+
+        items[idx].isLoadingThumb = true
+        let picker = items[idx].pickerItem
+
+        thumbTasks[id]?.cancel()
+        thumbTasks[id] = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let data = try? await picker.loadTransferable(type: Data.self)
+            if Task.isCancelled { return }
+
+            let img: UIImage? = {
+                guard let data else { return nil }
+                return ImageUtils.downsample(data: data, maxPixel: self.thumbMaxPixel)
+            }()
+
+            await MainActor.run {
+                guard let i = self.items.firstIndex(where: { $0.id == id }) else { return }
+                self.items[i].thumb = img
+                self.items[i].isLoadingThumb = false
+                if self.selectedID == id { self.syncSelectedToPreview() }
+            }
+        }
+    }
+
+    func ensurePreviewLoaded(id: UUID) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        if items[idx].preview != nil || items[idx].isLoadingPreview { return }
+
+        items[idx].isLoadingPreview = true
+        let picker = items[idx].pickerItem
+
+        previewTasks[id]?.cancel()
+        previewTasks[id] = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let data = try? await picker.loadTransferable(type: Data.self)
+            if Task.isCancelled { return }
+
+            let img: UIImage?
+            if let data {
+                img = ImageUtils.downsample(data: data, maxPixel: self.previewMaxPixel)
+            } else {
+                img = nil
+            }
+
+            let pxSize = img.map { CGSize(width: $0.size.width, height: $0.size.height) }
+                ?? .init(width: 1, height: 1)
+
+            await MainActor.run {
+                guard let i = self.items.firstIndex(where: { $0.id == id }) else { return }
+                self.items[i].preview = img
+                self.items[i].previewPixelSize = pxSize
+                self.items[i].isLoadingPreview = false
+
+                if self.items[i].status == NSLocalizedString("single.status.loading", comment: "") {
+                    self.items[i].status = NSLocalizedString("single.status.ready.simple", comment: "ready")
+                }
+                if self.selectedID == id { self.syncSelectedToPreview() }
+            }
+        }
+    }
+    
+    func prefetchNeighbors(around id: UUID, keepAround: Int) {
+        guard let selIdx = items.firstIndex(where: { $0.id == id }) else { return }
+
+        // 预取当前±keepAround
+        let lo = max(0, selIdx - keepAround)
+        let hi = min(items.count - 1, selIdx + keepAround)
+        if lo <= hi {
+            for j in lo...hi {
+                let nid = items[j].id
+                ensureThumbLoaded(id: nid)
+                ensurePreviewLoaded(id: nid)
+            }
+        }
+
+        // 释放远端 preview（thumb 保留）
+        for k in items.indices {
+            if abs(k - selIdx) > keepAround {
+                let rid = items[k].id
+                items[k].preview = nil
+                items[k].isLoadingPreview = false
+                previewTasks[rid]?.cancel()
+                previewTasks[rid] = nil
+            }
+        }
+    }
+
+    // MARK: - Public APIs
     func selectItem(_ id: UUID) {
         selectedID = id
         syncSelectedToPreview()
+        prefetchNeighbors(around: id, keepAround: 30)
     }
 
     func detectSelected() {
@@ -383,18 +499,14 @@ final class ImageDetectVM: ObservableObject {
         batchDone = 0
         batchCurrent = 0
 
-        // 先把每张图状态重置为 ready（保留 prepared）
-        let dst = Int(detector.inputSize)
+        // 先把每张图状态重置为 ready（不在这里做重预处理；检测时再按需加载与 resizeUniform）
         for i in items.indices {
             items[i].dets = []
-            if let p = items[i].prepared {
-                items[i].status = String(
-                    format: NSLocalizedString("single.status.ready", comment: "ready for detection"),
-                    locale: .current,
-                    dst, Int(p.roi.x), Int(p.roi.y), Int(p.roi.width), Int(p.roi.height)
-                )
-            } else {
-                items[i].status = NSLocalizedString("single.status.failed", comment: "fail to load image")
+            items[i].prepared = nil
+
+            // 如果预览尚未加载完成，就保持 loading；否则标记为可开始检测
+            if items[i].status != NSLocalizedString("single.status.loading", comment: "") {
+                items[i].status = NSLocalizedString("single.status.ready.simple", comment: "ready")
             }
         }
         syncSelectedToPreview()
@@ -453,6 +565,14 @@ final class ImageDetectVM: ObservableObject {
         batchRunID = UUID()
         batchQueue.cancelAllOperations()
         batchQueue.isSuspended = true
+
+        // 取消所有懒加载 / 推理任务（避免无意义资源占用）
+        thumbTasks.values.forEach { $0.cancel() }
+        previewTasks.values.forEach { $0.cancel() }
+        detectTasks.values.forEach { $0.cancel() }
+        thumbTasks.removeAll()
+        previewTasks.removeAll()
+        detectTasks.removeAll()
 
         items = []
         selectedID = nil
@@ -542,6 +662,10 @@ final class ImageDetectVM: ObservableObject {
         batchRunID = UUID() // 让旧回调失效
         batchQueue.cancelAllOperations()
         batchQueue.isSuspended = true
+
+        // 尽量取消仍在排队/等待的推理任务（正在调用 detector 的那一张不保证可中断）
+        detectTasks.values.forEach { $0.cancel() }
+        detectTasks.removeAll()
         if setState, !items.isEmpty {
             batchState = .cancelled
             // 可选：给未完成的标一下状态
@@ -566,16 +690,18 @@ final class ImageDetectVM: ObservableObject {
             return
         }
 
-        picked = item.image
+        picked = item.preview ?? item.thumb
         dets = item.dets
         status = item.status
+        srcPixelSize = item.previewPixelSize
 
         if let p = item.prepared {
             roi = p.roi
             srcPixelSize = p.srcPixelSize
         } else {
             roi = nil
-            srcPixelSize = .init(width: 1, height: 1)
+            // 没有 prepared 时，至少使用已加载预览/缩略图的尺寸，保证叠框比例正确
+            srcPixelSize = item.previewPixelSize
         }
     }
 
@@ -589,25 +715,20 @@ final class ImageDetectVM: ObservableObject {
     }
 
     /// 单张推理核心：可被“手动检测”和“批量队列”共用
+    /// 单张推理核心：可被“手动检测”和“批量队列”共用
     private func detectInternal(id: UUID, completion: @escaping () -> Void) {
-        // 读取快照（线程安全：通过 main queue 读取 items）
-        let snapshot: (image: UIImage, prepared: Prepared?)? = {
-            if Thread.isMainThread {
-                guard let item = items.first(where: { $0.id == id }) else { return nil }
-                return (item.image, item.prepared)
-            } else {
-                return DispatchQueue.main.sync {
-                    guard let item = self.items.first(where: { $0.id == id }) else { return nil }
-                    return (item.image, item.prepared)
-                }
+        // 如果同一张图正在推理，先取消旧任务（避免结果回写顺序错乱）
+        if Thread.isMainThread {
+            detectTasks[id]?.cancel()
+            detectTasks[id] = nil
+        } else {
+            DispatchQueue.main.sync {
+                self.detectTasks[id]?.cancel()
+                self.detectTasks[id] = nil
             }
-        }()
-
-        guard let snapshot else {
-            DispatchQueue.main.async { completion() }
-            return
         }
 
+        let runID = batchRunID
         let dst = Int(detector.inputSize)
 
         // 先把 UI 状态更新成 running（在主线程）
@@ -619,20 +740,106 @@ final class ImageDetectVM: ObservableObject {
             }
         }
 
-        // 真正推理与映射放在 q 串行队列（避免 detector 线程不安全问题）
-        q.async { [weak self] in
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else {
-                DispatchQueue.main.async { completion() }
+                await MainActor.run { completion() }
                 return
             }
 
-            // 准备输入：优先用缓存 prepared；没有就现算一次
+            // 推理结束后清理任务引用
+            defer {
+                Task { @MainActor [weak self] in
+                    self?.detectTasks[id] = nil
+                }
+            }
+
+            // 读取必要快照（从主线程拷贝，避免数据竞争）
+            let snap = await MainActor.run { () -> (pickerItem: PhotosPickerItem, preview: UIImage?, thumb: UIImage?, prepared: Prepared?)? in
+                guard let item = self.items.first(where: { $0.id == id }) else { return nil }
+                return (item.pickerItem, item.preview, item.thumb, item.prepared)
+            }
+
+            guard let snap else {
+                await MainActor.run { completion() }
+                return
+            }
+
+            if Task.isCancelled {
+                await MainActor.run { completion() }
+                return
+            }
+
+            // 选择推理用的源图：优先 preview；没有则从 PhotosPickerItem 拉 Data 并 downsample
+            var srcImage: UIImage? = snap.preview
+            var thumbImage: UIImage? = snap.thumb
+
+            if srcImage == nil {
+                let data = try? await snap.pickerItem.loadTransferable(type: Data.self)
+                if Task.isCancelled {
+                    await MainActor.run { completion() }
+                    return
+                }
+
+                guard let data else {
+                    await MainActor.run {
+                        guard self.batchRunID == runID else { completion(); return }
+                        if let idx = self.items.firstIndex(where: { $0.id == id }) {
+                            self.items[idx].status = NSLocalizedString("single.status.failed", comment: "fail to load image")
+                            if self.selectedID == id { self.syncSelectedToPreview() }
+                        }
+                        completion()
+                    }
+                    return
+                }
+
+                // 下采样生成 preview / thumb（都在后台完成，避免主线程卡顿）
+                srcImage = ImageUtils.downsample(data: data, maxPixel: self.previewMaxPixel)
+                if thumbImage == nil {
+                    thumbImage = ImageUtils.downsample(data: data, maxPixel: self.thumbMaxPixel)
+                }
+
+                // 回写缓存（如果这一轮仍然有效）
+                await MainActor.run {
+                    guard self.batchRunID == runID else { return }
+                    guard let idx = self.items.firstIndex(where: { $0.id == id }) else { return }
+
+                    if self.items[idx].thumb == nil { self.items[idx].thumb = thumbImage }
+                    if self.items[idx].preview == nil {
+                        self.items[idx].preview = srcImage
+                        if let srcImage {
+                            self.items[idx].previewPixelSize = .init(width: srcImage.size.width, height: srcImage.size.height)
+                        }
+                    }
+                    self.items[idx].isLoadingPreview = false
+
+                    if self.selectedID == id { self.syncSelectedToPreview() }
+                }
+            }
+
+            guard let srcImage else {
+                await MainActor.run {
+                    guard self.batchRunID == runID else { completion(); return }
+                    if let idx = self.items.firstIndex(where: { $0.id == id }) {
+                        self.items[idx].status = NSLocalizedString("single.status.failed", comment: "fail to load image")
+                        if self.selectedID == id { self.syncSelectedToPreview() }
+                    }
+                    completion()
+                }
+                return
+            }
+
+            // 准备输入：优先复用 cached prepared（srcPixelSize 匹配时）；否则现算一次
+            let currentSrcSize = CGSize(width: srcImage.size.width, height: srcImage.size.height)
             let prep: Prepared?
-            if let p = snapshot.prepared {
+
+            if let p = snap.prepared,
+               abs(p.srcPixelSize.width - currentSrcSize.width) < 0.5,
+               abs(p.srcPixelSize.height - currentSrcSize.height) < 0.5 {
                 prep = p
             } else {
-                guard let r = ImageUtils.resizeUniform(snapshot.image, dst: dst) else {
-                    DispatchQueue.main.async {
+                guard let r = ImageUtils.resizeUniform(srcImage, dst: dst) else {
+                    await MainActor.run {
+                        guard self.batchRunID == runID else { completion(); return }
                         if let idx = self.items.firstIndex(where: { $0.id == id }) {
                             self.items[idx].status = NSLocalizedString("single.status.failed.resize", comment: "fail to resize uniform")
                             if self.selectedID == id { self.syncSelectedToPreview() }
@@ -645,13 +852,14 @@ final class ImageDetectVM: ObservableObject {
             }
 
             guard let prep else {
-                DispatchQueue.main.async { completion() }
+                await MainActor.run { completion() }
                 return
             }
 
-            // CVPixelBuffer
+            // CVPixelBuffer（可在后台线程创建）
             guard let pb = ImageUtils.pixelBufferBGRA(from: prep.ui, dst: dst) else {
-                DispatchQueue.main.async {
+                await MainActor.run {
+                    guard self.batchRunID == runID else { completion(); return }
                     if let idx = self.items.firstIndex(where: { $0.id == id }) {
                         self.items[idx].status = NSLocalizedString("single.status.failed.pxbuffer", comment: "fail to create pixel buffer")
                         if self.selectedID == id { self.syncSelectedToPreview() }
@@ -661,9 +869,15 @@ final class ImageDetectVM: ObservableObject {
                 return
             }
 
-            // ObjC: detectWithPixelBuffer: => Swift: detect(with:)
-            let raw = (self.detector.detect(with: pb) as? [[AnyHashable: Any]]) ?? []
+            // detector 非线程安全：必须串行调用
+            let raw: [[AnyHashable: Any]] = await withCheckedContinuation { (cont: CheckedContinuation<[[AnyHashable: Any]], Never>) in
+                self.q.async {
+                    let out = (self.detector.detect(with: pb) as? [[AnyHashable: Any]]) ?? []
+                    cont.resume(returning: out)
+                }
+            }
 
+            // 结果映射
             var mapped: [(CGRect, String, Float)] = []
             mapped.reserveCapacity(raw.count)
 
@@ -725,14 +939,13 @@ final class ImageDetectVM: ObservableObject {
                 mapped.append((rectNorm, label, score.floatValue))
             }
 
-            DispatchQueue.main.async {
-                // 可能已经换了一批图片：用 id 再找一次
-                guard let idx = self.items.firstIndex(where: { $0.id == id }) else {
-                    completion()
-                    return
-                }
+            await MainActor.run {
+                defer { completion() }
 
-                // 回写 prepared（用于后续复用）
+                // 若用户已重新开始/取消，这一轮结果不再回写
+                guard self.batchRunID == runID else { return }
+                guard let idx = self.items.firstIndex(where: { $0.id == id }) else { return }
+
                 self.items[idx].prepared = prep
                 self.items[idx].dets = mapped
                 self.items[idx].status = String.localizedStringWithFormat(
@@ -740,13 +953,16 @@ final class ImageDetectVM: ObservableObject {
                     mapped.count, dst
                 )
 
-                if self.selectedID == id {
-                    self.syncSelectedToPreview()
-                }
-                completion()
+                if self.selectedID == id { self.syncSelectedToPreview() }
             }
         }
+
+        // 记录任务，便于取消
+        DispatchQueue.main.async {
+            self.detectTasks[id] = task
+        }
     }
+
 }
 
 struct ImageDetectScreen: View {
@@ -765,12 +981,17 @@ struct ImageDetectScreen: View {
 
             // 缩略图条（多张才显示）
             if vm.items.count > 1 {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(vm.items) { item in
-                            Image(uiImage: item.image)
-                                .resizable()
-                                .scaledToFill()
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(vm.items) { item in
+                                ZStack {
+                                    if let t = item.thumb {
+                                        Image(uiImage: t).resizable().scaledToFill()
+                                    } else {
+                                        Color.black.opacity(0.12)
+                                    }
+                                }
                                 .frame(width: 64, height: 64)
                                 .clipped()
                                 .overlay(
@@ -778,14 +999,26 @@ struct ImageDetectScreen: View {
                                         .stroke(item.id == vm.selectedID ? .orange : .clear, lineWidth: 3)
                                 )
                                 .clipShape(RoundedRectangle(cornerRadius: 10))
-                                .onTapGesture {
-                                    vm.selectItem(item.id)
-                                }
+                                .id(item.id) // 关键：用于 scrollTo
+                                .onTapGesture { vm.selectItem(item.id) }
+                                .task { vm.ensureThumbLoaded(id: item.id) }
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                    }
+                    // 选中项变化（点击缩略图或左右滑动预览）=> 自动居中
+                    .onChange(of: vm.selectedID) { _, newID in
+                        guard let newID else { return }
+                        // 让出一帧，避免和布局/图片异步加载抢时序导致 scrollTo 偶发失效
+                        DispatchQueue.main.async {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                proxy.scrollTo(newID, anchor: .center)
+                            }
                         }
                     }
-                    .padding(.horizontal, 14)
                 }
             }
+
 
             ZStack {
                 Color.black.opacity(0.06)
@@ -798,19 +1031,27 @@ struct ImageDetectScreen: View {
                         ForEach(vm.items) { item in
                             GeometryReader { geo in
                                 ZStack {
-                                    Image(uiImage: item.image)
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(width: geo.size.width, height: geo.size.height)
+                                    if let img = item.preview ?? item.thumb {
+                                        Image(uiImage: img)
+                                            .resizable()
+                                            .scaledToFit()
+                                            .frame(width: geo.size.width, height: geo.size.height)
 
-                                    ImageOverlayFit(
-                                        detections: item.dets,
-                                        srcPixelSize: item.prepared?.srcPixelSize ?? .init(width: 1, height: 1)
-                                    )
+                                        ImageOverlayFit(
+                                            detections: item.dets,
+                                            srcPixelSize: (item.preview?.size ?? item.thumb?.size).map { .init(width: $0.width, height: $0.height) } ?? item.previewPixelSize
+                                        )
+                                    } else {
+                                        ProgressView()
+                                    }
                                 }
                                 .frame(width: geo.size.width, height: geo.size.height)
                             }
-                            .tag(Optional(item.id)) // 注意：selection 是 UUID?，tag 也要 Optional
+                            .task {
+                                vm.ensureThumbLoaded(id: item.id)
+                                vm.ensurePreviewLoaded(id: item.id)
+                            }
+                            .tag(Optional(item.id))
                         }
                     }
                     .tabViewStyle(.page(indexDisplayMode: .never)) // 不显示底部小圆点（你已有缩略图条）
@@ -895,28 +1136,10 @@ struct ImageDetectScreen: View {
             Spacer(minLength: 10)
         }
         .onChange(of: pickerItems) { _, newItems in
-            guard !newItems.isEmpty else { return }
-            Task {
-                var images: [UIImage] = []
-                images.reserveCapacity(newItems.count)
-
-                // 串行加载，避免一次性并发解码导致内存峰值
-                for it in newItems {
-                    if let data = try? await it.loadTransferable(type: Data.self),
-                       let image = UIImage(data: data) {
-                        images.append(image)
-                    }
-                }
-
-                DispatchQueue.main.async {
-                    if images.isEmpty {
-                        vm.status = NSLocalizedString("single.status.failed", comment: "fail to load image")
-                    } else {
-                        vm.setImages(images)
-                    }
-                }
-            }
+            vm.setPickerItems(newItems)
         }
+
+
     }
     private func primaryBatchButtonColor(for state: ImageDetectVM.BatchState) -> Color {
         switch state {

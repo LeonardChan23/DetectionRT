@@ -490,36 +490,53 @@
         }
       }
     },
+    "single.status.loading" : {
+      "comment" : "loading",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载中……"
+          }
+        }
+      }
+    },
     "single.status.pick" : {
       "comment" : "pick a image",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Please Pick an image"
+            "value" : "Pick 30 images at most"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请选一张图片"
+            "value" : "选择最多30张图片"
           }
         }
       }
     },
-    "single.status.ready" : {
-      "comment" : "ready for detection",
+    "single.status.ready.simple" : {
+      "comment" : "ready",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ready for Detection (dst=%d roi: x=%d y=%d w=%d h=%d)"
+            "value" : "Ready for Detection"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "可用于检测 (dst=%d roi: x=%d y=%d w=%d h=%d)"
+            "value" : "可用于检测"
           }
         }
       }
