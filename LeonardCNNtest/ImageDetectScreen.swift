@@ -999,6 +999,12 @@ struct ImageDetectScreen: View {
                                         .stroke(item.id == vm.selectedID ? .orange : .clear, lineWidth: 3)
                                 )
                                 .clipShape(RoundedRectangle(cornerRadius: 10))
+                                .contentShape(RoundedRectangle(cornerRadius: 10))
+                                .highPriorityGesture(
+                                    TapGesture().onEnded {
+                                        vm.selectItem(item.id)
+                                    }
+                                )
                                 .id(item.id) // 关键：用于 scrollTo
                                 .onTapGesture { vm.selectItem(item.id) }
                                 .task { vm.ensureThumbLoaded(id: item.id) }
