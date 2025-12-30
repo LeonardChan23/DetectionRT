@@ -1,6 +1,22 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "(%lld/%lld)" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "(%1$lld/%2$lld)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "(%1$lld/%2$lld)"
+          }
+        }
+      }
+    },
     "%@ %lld%%" : {
       "localizations" : {
         "zh-Hans" : {
@@ -23,6 +39,91 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "请在系统设置中允许相机权限，然后重新打开 App。"
+          }
+        }
+      }
+    },
+    "Batch.Cancel" : {
+      "comment" : "Cancel Batch",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "取消"
+          }
+        }
+      }
+    },
+    "Batch.CancelClear" : {
+      "comment" : "Cancel and clear Batch",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel & Clear"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "取消并清除"
+          }
+        }
+      }
+    },
+    "Batch.Pause" : {
+      "comment" : "Pause batch",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pause"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "暂停"
+          }
+        }
+      }
+    },
+    "Batch.Resume" : {
+      "comment" : "Resume batch",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resume"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "恢复"
+          }
+        }
+      }
+    },
+    "Batch.Start" : {
+      "comment" : "Start batch",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Start"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "开始"
           }
         }
       }
@@ -237,6 +338,40 @@
         }
       }
     },
+    "Photos.Clear" : {
+      "comment" : "Clear Photo",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Clear Photos"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "清除图片"
+          }
+        }
+      }
+    },
+    "single.status.cancelled" : {
+      "comment" : "cancelled",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Canclled"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已取消"
+          }
+        }
+      }
+    },
     "single.status.done" : {
       "comment" : "Detection finished status",
       "localizations" : {
@@ -411,13 +546,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Detect Once"
+            "value" : "Detect Current"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "检测一次"
+            "value" : "检测当前"
           }
         }
       }

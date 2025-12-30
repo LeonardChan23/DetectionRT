@@ -193,7 +193,7 @@ static inline bool makeOutView(const MNN::Tensor* t, OutView& v) {
     backendConfig.memory    = MNN::BackendConfig::Memory_High;
 
     MNN::ScheduleConfig cfg;
-    cfg.type = MNN_FORWARD_METAL;          // GPU: Metal
+    cfg.type = MNN_FORWARD_NN;          // GPU: coreml
     cfg.backupType = MNN_FORWARD_CPU;      // Metal 不可用则回落 CPU
     cfg.numThread = 4;                     // 仅对 backup CPU 有意义
     cfg.backendConfig = &backendConfig;
