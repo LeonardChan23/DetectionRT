@@ -494,7 +494,7 @@ final class CameraScreenViewModel: ObservableObject {
         inferenceQueue.async { [pixelBuffer, token, detector] in
             defer { self.infGate.signal() }
 
-            // ✅ autoreleasepool：防止 ObjC 桥接对象在后台线程堆积导致“越跑越慢”
+            // autoreleasepool：防止 ObjC 桥接对象在后台线程堆积导致“越跑越慢”
             let mapped: [Detection] = autoreleasepool {
                 let raw = (detector.detect(with: pixelBuffer) as? [[AnyHashable: Any]]) ?? []
 
@@ -635,12 +635,12 @@ struct DetectionOverlay: View {
 // MARK: - Screen (UI)
 struct CameraScreen: View {
     @StateObject private var vm = CameraScreenViewModel()
-    @State private var baseZoom: CGFloat = 1.5
+    @State private var baseZoom: CGFloat = 1.0
     
-    @State private var uiBasePhysicalZoom: CGFloat = 0          // UI 的“1.0x”对应的物理倍率（默认 2.x）
+    @State private var uiBasePhysicalZoom: CGFloat = 2.0          // UI 的“1.0x”对应的物理倍率（默认 2.x）
     @State private var showZoomHUD: Bool = false
     @State private var hideZoomWorkItem: DispatchWorkItem?
-    @State private var didIgnoreFirstZoomChange: Bool = false   // 避免启动默认设2x时HUD闪一下
+//    @State private var didIgnoreFirstZoomChange: Bool = false   // 避免启动默认设2x时HUD闪一下
     @State private var isPinching: Bool = false                 // 防止 pinch 过程中 baseZoom 被外部 onChange 打断
 
     private func clamp(_ x: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
@@ -682,8 +682,8 @@ struct CameraScreen: View {
                             isPinching = false
                             let target = baseZoom * value
                             baseZoom = max(vm.camera.minZoomFactor, min(target, vm.camera.maxZoomFactor))
-                            vm.camera.cancelZoomRamp()
                             vm.camera.setZoom(baseZoom)
+//                            vm.camera.cancelZoomRamp()
 //                            vm.camera.zoomFactor = AVCaptureDevice.
                         }
                 )
@@ -748,7 +748,7 @@ struct CameraScreen: View {
                 .padding(.horizontal, 14)
                 
                 // Zoom HUD：仅在 zoomFactor 变化/交互时显示，正常隐藏
-                if showZoomHUD, uiBasePhysicalZoom > 0 {
+                if showZoomHUD {
                     Text(String(format: "%.1fx", displayZoom))
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white)
@@ -760,7 +760,7 @@ struct CameraScreen: View {
                 
                 Spacer()
                 
-                if showZoomHUD, uiBasePhysicalZoom > 0 {
+                if showZoomHUD {
                     HStack(spacing: 10) {
                         ForEach([0.5, 1.0, 3.0], id: \.self) { d in
                             let selected = abs(displayZoom - d) < 0.12
@@ -825,22 +825,10 @@ struct CameraScreen: View {
             vm.requestPermissionAndSetup()
         }
         .onChange(of: vm.camera.zoomFactor) { _, newZoom in
-            // 1) UI 基准：只在第一次拿到“默认 2.x”时锁定
-            //    你默认设为2x，所以这里通常会在 newZoom≈2.x 时锁定
-            if uiBasePhysicalZoom <= 0, newZoom >= 1.5 {
-                uiBasePhysicalZoom = newZoom
-                baseZoom = newZoom
-            }
-            
-            // 2) 非 pinch 期间，让 baseZoom 跟随真实倍率（避免下次捏合从旧值跳）
+
+            //非 pinch 期间，让 baseZoom 跟随真实倍率（避免下次捏合从旧值跳）
             if !isPinching {
                 baseZoom = newZoom
-            }
-            
-            // 3) 只在“真实倍率变化”时显示 HUD，且忽略首次初始化变化
-            if !didIgnoreFirstZoomChange {
-                didIgnoreFirstZoomChange = true
-                return
             }
             revealZoomHUD()
         }
