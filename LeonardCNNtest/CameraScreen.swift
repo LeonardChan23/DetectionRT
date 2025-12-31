@@ -61,10 +61,66 @@ final class CameraSessionManager: NSObject {
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
 
     private var isConfigured = false
+    
+    private var videoDevice: AVCaptureDevice?
+    private(set) var minZoomFactor: CGFloat = 1.0
+    private(set) var maxZoomFactor: CGFloat = 1.0
+    @Published var zoomFactor: CGFloat = 1.0
 
     /// 每帧回调（在 videoQueue 上触发）
     /// 注意：这里传出的 pixelBuffer 是“已 retain”的；接收方必须在用完后 CVPixelBufferRelease
     var onFrame: ((CVPixelBuffer) -> Void)?
+    
+    func rampZoom(_ factor: CGFloat, rate: Float = 10.0) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.videoDevice else { return }
+
+            let clamped = max(self.minZoomFactor, min(factor, self.maxZoomFactor))
+
+            do {
+                try device.lockForConfiguration()
+                device.ramp(toVideoZoomFactor: clamped, withRate: rate)
+                device.unlockForConfiguration()
+
+                Task { @MainActor in
+                    self.zoomFactor = clamped
+                }
+            } catch {
+                print("Zoom lock error: \(error)")
+            }
+        }
+    }
+
+    func setZoom(_ factor: CGFloat) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.videoDevice else { return }
+
+            let clamped = max(self.minZoomFactor, min(factor, self.maxZoomFactor))
+
+            do {
+                try device.lockForConfiguration()
+                device.videoZoomFactor = clamped
+                device.unlockForConfiguration()
+
+                Task { @MainActor in
+                    self.zoomFactor = clamped
+                }
+            } catch {
+                print("Zoom lock error: \(error)")
+            }
+        }
+    }
+
+    func cancelZoomRamp() {
+        sessionQueue.async { [weak self] in
+            guard let device = self?.videoDevice else { return }
+            do {
+                try device.lockForConfiguration()
+                device.cancelVideoZoomRamp()
+                device.unlockForConfiguration()
+            } catch { }
+        }
+    }
 
     func configureIfNeeded() throws {
         try sessionQueue.sync {
@@ -74,10 +130,22 @@ final class CameraSessionManager: NSObject {
             session.beginConfiguration()
             session.sessionPreset = .high
 
-            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            let device =
+                AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back) ??
+                AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back) ??
+                AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) ??
+                AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+
+            guard let device else {
                 session.commitConfiguration()
                 throw NSError(domain: "Camera", code: -1, userInfo: [NSLocalizedDescriptionKey: "未找到后摄"])
             }
+            
+            self.videoDevice = device
+            self.minZoomFactor = device.minAvailableVideoZoomFactor
+            self.maxZoomFactor = min(device.maxAvailableVideoZoomFactor, 8.0) // 你可以调整上限
+            self.zoomFactor = device.videoZoomFactor
+
 
             let input = try AVCaptureDeviceInput(device: device)
             guard session.canAddInput(input) else {
@@ -85,7 +153,19 @@ final class CameraSessionManager: NSObject {
                 throw NSError(domain: "Camera", code: -2, userInfo: [NSLocalizedDescriptionKey: "无法添加相机输入"])
             }
             session.addInput(input)
+            
+            let defaultZoom: CGFloat = 2.0
+            let clamped = max(device.minAvailableVideoZoomFactor,
+                              min(defaultZoom, device.maxAvailableVideoZoomFactor))
 
+            do {
+                try device.lockForConfiguration()
+                device.videoZoomFactor = clamped
+                device.unlockForConfiguration()
+            } catch {
+                print("set default zoom failed: \(error)")
+            }
+            
             videoOutput.alwaysDiscardsLateVideoFrames = true
             videoOutput.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -107,6 +187,10 @@ final class CameraSessionManager: NSObject {
             }
 
             session.commitConfiguration()
+            print("deviceType=\(device.deviceType), isVirtual=\(device.isVirtualDevice), min=\(device.minAvailableVideoZoomFactor), max=\(device.maxAvailableVideoZoomFactor)")
+            if device.isVirtualDevice {
+                print("switchOver=\(device.virtualDeviceSwitchOverVideoZoomFactors)")
+            }
         }
     }
 
@@ -550,11 +634,23 @@ struct DetectionOverlay: View {
 // MARK: - Screen (UI)
 struct CameraScreen: View {
     @StateObject private var vm = CameraScreenViewModel()
+    @State private var baseZoom: CGFloat = 1.0
 
     var body: some View {
         ZStack {
             // Camera preview
             CameraPreview(session: vm.camera.session)
+                .gesture(
+                    MagnificationGesture()
+                        .onChanged { value in
+                            vm.camera.rampZoom(baseZoom * value)   // 连续变化，顺滑切镜头
+                        }
+                        .onEnded { value in
+                            let target = baseZoom * value
+                            baseZoom = max(vm.camera.minZoomFactor, min(target, vm.camera.maxZoomFactor))
+                            vm.camera.cancelZoomRamp()
+                        }
+                )
                 .ignoresSafeArea()
 
             // Overlay boxes
