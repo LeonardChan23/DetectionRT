@@ -71,7 +71,7 @@ final class CameraSessionManager: NSObject {
     /// 注意：这里传出的 pixelBuffer 是“已 retain”的；接收方必须在用完后 CVPixelBufferRelease
     var onFrame: ((CVPixelBuffer) -> Void)?
     
-    func rampZoom(_ factor: CGFloat, rate: Float = 10.0) {
+    func rampZoom(_ factor: CGFloat, rate: Float = 30.0) {
         sessionQueue.async { [weak self] in
             guard let self, let device = self.videoDevice else { return }
 
@@ -118,6 +118,7 @@ final class CameraSessionManager: NSObject {
                 try device.lockForConfiguration()
                 device.cancelVideoZoomRamp()
                 device.unlockForConfiguration()
+                self?.zoomFactor = device.videoZoomFactor
             } catch { }
         }
     }
@@ -143,7 +144,7 @@ final class CameraSessionManager: NSObject {
             
             self.videoDevice = device
             self.minZoomFactor = device.minAvailableVideoZoomFactor
-            self.maxZoomFactor = min(device.maxAvailableVideoZoomFactor, 8.0) // 你可以调整上限
+            self.maxZoomFactor = min(device.maxAvailableVideoZoomFactor, 12.0) // 你可以调整上限
             self.zoomFactor = device.videoZoomFactor
 
 
@@ -634,31 +635,75 @@ struct DetectionOverlay: View {
 // MARK: - Screen (UI)
 struct CameraScreen: View {
     @StateObject private var vm = CameraScreenViewModel()
-    @State private var baseZoom: CGFloat = 1.0
+    @State private var baseZoom: CGFloat = 1.5
+    
+    @State private var uiBasePhysicalZoom: CGFloat = 0          // UI 的“1.0x”对应的物理倍率（默认 2.x）
+    @State private var showZoomHUD: Bool = false
+    @State private var hideZoomWorkItem: DispatchWorkItem?
+    @State private var didIgnoreFirstZoomChange: Bool = false   // 避免启动默认设2x时HUD闪一下
+    @State private var isPinching: Bool = false                 // 防止 pinch 过程中 baseZoom 被外部 onChange 打断
+
+    private func clamp(_ x: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+        max(lo, min(x, hi))
+    }
+
+    private func revealZoomHUD() {
+        withAnimation(.easeInOut(duration: 0.15)) {
+            showZoomHUD = true
+        }
+
+        hideZoomWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                showZoomHUD = false
+            }
+        }
+
+        hideZoomWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: workItem)
+    }
 
     var body: some View {
+        let base = (uiBasePhysicalZoom > 0) ? uiBasePhysicalZoom : 2.0
+        let displayZoom = vm.camera.zoomFactor / base
+
         ZStack {
             // Camera preview
             CameraPreview(session: vm.camera.session)
                 .gesture(
                     MagnificationGesture()
                         .onChanged { value in
-                            vm.camera.rampZoom(baseZoom * value)   // 连续变化，顺滑切镜头
+                            isPinching = true
+                            vm.camera.rampZoom(baseZoom * value)   // 你的原逻辑：物理倍率缩放
+                            revealZoomHUD()
                         }
                         .onEnded { value in
+                            isPinching = false
                             let target = baseZoom * value
                             baseZoom = max(vm.camera.minZoomFactor, min(target, vm.camera.maxZoomFactor))
                             vm.camera.cancelZoomRamp()
+                            vm.camera.setZoom(baseZoom)
+//                            vm.camera.zoomFactor = AVCaptureDevice.
                         }
                 )
+                .simultaneousGesture(
+                    TapGesture(count: 2).onEnded {
+                        // 双击回“UI 1.0x”= 物理回到 uiBasePhysicalZoom（默认 2.x）
+                        let base = (uiBasePhysicalZoom > 0) ? uiBasePhysicalZoom : 2.0
+                        vm.camera.rampZoom(base)
+                        baseZoom = base
+                        revealZoomHUD()
+                    }
+                )
                 .ignoresSafeArea()
-
+            
             // Overlay boxes
             DetectionOverlay(detections: vm.detections, frameSize: vm.frameSize, rotate90: vm.rotate90)
                 .ignoresSafeArea()
-
+            
             // Top bar
-            VStack(spacing: 0) {
+            VStack(spacing: 10) {
                 HStack {
                     Text(vm.isRunning ? "camera.Running" : "camera.Stopped")
                         .font(.system(size: 14, weight: .semibold))
@@ -667,6 +712,7 @@ struct CameraScreen: View {
                         .padding(.vertical, 6)
                         .background(.black.opacity(0.55))
                         .clipShape(RoundedRectangle(cornerRadius: 10))
+                    
                     Text("Det: \(vm.detections.count)")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white)
@@ -674,31 +720,23 @@ struct CameraScreen: View {
                         .padding(.vertical, 6)
                         .background(.black.opacity(0.55))
                         .clipShape(RoundedRectangle(cornerRadius: 10))
-//                    Text("Frame: \(vm.frameCount)")
-//                        .font(.system(size: 14, weight: .semibold))
-//                        .foregroundStyle(.white)
-//                        .padding(.horizontal, 10)
-//                        .padding(.vertical, 6)
-//                        .background(.black.opacity(0.55))
-//                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    
                     Text(verbatim: String(format: NSLocalizedString("camera_fps", comment: "camera FPS label"), locale: .current, vm.camFPS))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
                         .background(.black.opacity(0.55))
                         .clipShape(RoundedRectangle(cornerRadius: 10))
-
+                    
                     Text(verbatim: String(format: NSLocalizedString("inference_fps", comment: "inference FPS label"), locale: .current, vm.infFPS))
-//                        .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
                         .background(.black.opacity(0.55))
                         .clipShape(RoundedRectangle(cornerRadius: 10))
-
-
+                    
                     Spacer()
-
+                    
                     Toggle("Demo", isOn: Binding(
                         get: { vm.demoOverlay },
                         set: { vm.setDemoOverlay($0) }
@@ -708,9 +746,47 @@ struct CameraScreen: View {
                 }
                 .padding(.top, 14)
                 .padding(.horizontal, 14)
-
+                
+                // Zoom HUD：仅在 zoomFactor 变化/交互时显示，正常隐藏
+                if showZoomHUD, uiBasePhysicalZoom > 0 {
+                    Text(String(format: "%.1fx", displayZoom))
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 10)
+                        .background(.black.opacity(0.55))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                
                 Spacer()
+                
+                if showZoomHUD, uiBasePhysicalZoom > 0 {
+                    HStack(spacing: 10) {
+                        ForEach([0.5, 1.0, 3.0], id: \.self) { d in
+                            let selected = abs(displayZoom - d) < 0.12
 
+                            Button {
+                                let targetPhysical = clamp(d * base, vm.camera.minZoomFactor, vm.camera.maxZoomFactor)
+                                vm.camera.rampZoom(targetPhysical)
+                                baseZoom = targetPhysical
+                                revealZoomHUD()
+                            } label: {
+                                Text(String(format: "%.1fx", d))   // 你想要的 0.5 1.0 3.0
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 10)
+                                    .background(selected ? .white.opacity(0.22) : .black.opacity(0.35))
+                                    .clipShape(Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10) // 距离开始按钮的间距，可调
+                    .transition(.opacity)
+                }
+                
                 // Bottom bar
                 HStack(spacing: 12) {
                     Button {
@@ -728,7 +804,7 @@ struct CameraScreen: View {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 18)
             }
-
+            
             // Permission denied overlay
             if vm.permission == .denied {
                 VStack(spacing: 10) {
@@ -746,8 +822,31 @@ struct CameraScreen: View {
             }
         }
         .onAppear {
-//            vm.startThermalMonitor()
             vm.requestPermissionAndSetup()
+        }
+        .onChange(of: vm.camera.zoomFactor) { _, newZoom in
+            // 1) UI 基准：只在第一次拿到“默认 2.x”时锁定
+            //    你默认设为2x，所以这里通常会在 newZoom≈2.x 时锁定
+            if uiBasePhysicalZoom <= 0, newZoom >= 1.5 {
+                uiBasePhysicalZoom = newZoom
+                baseZoom = newZoom
+            }
+            
+            // 2) 非 pinch 期间，让 baseZoom 跟随真实倍率（避免下次捏合从旧值跳）
+            if !isPinching {
+                baseZoom = newZoom
+            }
+            
+            // 3) 只在“真实倍率变化”时显示 HUD，且忽略首次初始化变化
+            if !didIgnoreFirstZoomChange {
+                didIgnoreFirstZoomChange = true
+                return
+            }
+            revealZoomHUD()
+        }
+        .onDisappear {
+            hideZoomWorkItem?.cancel()
+            hideZoomWorkItem = nil
         }
     }
 }
